@@ -154,30 +154,55 @@ class ZeroConv2d(nn.Module):
 
 
 class AffineCoupling(nn.Module):
-    def __init__(self, in_channel, filter_size=512, affine=True):
+    def __init__(self, in_channel, filter_size=512, affine=True, num_conditional=None):
         super().__init__()
 
         self.affine = affine
 
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channel // 2, filter_size, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(filter_size, filter_size, 1),
-            nn.ReLU(inplace=True),
-            ZeroConv2d(filter_size, in_channel if self.affine else in_channel // 2),
-        )
+#JWF
+#        self.net = nn.Sequential(
+#            nn.Conv2d(in_channel // 2, filter_size, 3, padding=1),
+#            nn.ReLU(inplace=True),
+#            nn.Conv2d(filter_size, filter_size, 1),
+#            nn.ReLU(inplace=True),
+#            ZeroConv2d(filter_size, in_channel if self.affine else in_channel // 2),
+#        )
+        self.net0 = nn.Conv2d(in_channel // 2, filter_size, 3, padding=1)
+        self.net1 = nn.Conv2d(filter_size, filter_size, 1)
+        self.net2 = ZeroConv2d(filter_size, in_channel if self.affine else in_channel // 2)
 
-        self.net[0].weight.data.normal_(0, 0.05)
-        self.net[0].bias.data.zero_()
+        self.net0.weight.data.normal_(0, 0.05)
+        self.net0.bias.data.zero_()
 
-        self.net[2].weight.data.normal_(0, 0.05)
-        self.net[2].bias.data.zero_()
+        self.net1.weight.data.normal_(0, 0.05)
+        self.net1.bias.data.zero_()
 
-    def forward(self, input):
+        if num_conditional is not None:
+            self.conditional_prj = nn.Linear(num_conditional, filter_size, bias=False)
+        else:
+            self.conditional_prj = None
+
+
+    def net_out(self, input, conditional=None):
+        x = input
+        x = self.net0(x)
+        x = nn.ReLU(inplace=True)(x)
+        x = self.net1(x)
+        if conditional is not None:
+            prj = self.conditional_prj(conditional)
+            add_x = x.permute((2,3,0,1)) + prj
+            x = add_x.permute((2,3,0,1))
+        x = nn.ReLU(inplace=True)(x)
+        x = self.net2(x)
+#        x = nn.ReLU(inplace=True)(x)
+        return x
+
+    def forward(self, input, conditional=None):
         in_a, in_b = input.chunk(2, 1)
 
+        net_out = self.net_out(in_a, conditional)
         if self.affine:
-            log_s, t = self.net(in_a).chunk(2, 1)
+            log_s, t = net_out.chunk(2, 1)
             # s = torch.exp(log_s)
             s = F.sigmoid(log_s + 2)
             # out_a = s * in_a + t
@@ -186,31 +211,31 @@ class AffineCoupling(nn.Module):
             logdet = torch.sum(torch.log(s).view(input.shape[0], -1), 1)
 
         else:
-            net_out = self.net(in_a)
             out_b = in_b + net_out
             logdet = None
 
         return torch.cat([in_a, out_b], 1), logdet
 
-    def reverse(self, output):
+    def reverse(self, output, conditional=None):
         out_a, out_b = output.chunk(2, 1)
 
+        net_out = self.net_out(out_a, conditional)
         if self.affine:
-            log_s, t = self.net(out_a).chunk(2, 1)
+            log_s, t = net_out.chunk(2, 1)
             # s = torch.exp(log_s)
             s = F.sigmoid(log_s + 2)
             # in_a = (out_a - t) / s
             in_b = out_b / s - t
 
         else:
-            net_out = self.net(out_a)
+            net_out = net_out
             in_b = out_b - net_out
 
         return torch.cat([out_a, in_b], 1)
 
 
 class Flow(nn.Module):
-    def __init__(self, in_channel, affine=True, conv_lu=True):
+    def __init__(self, in_channel, affine=True, conv_lu=True, num_conditional=None):
         super().__init__()
 
         self.actnorm = ActNorm(in_channel)
@@ -221,12 +246,12 @@ class Flow(nn.Module):
         else:
             self.invconv = InvConv2d(in_channel)
 
-        self.coupling = AffineCoupling(in_channel, affine=affine)
+        self.coupling = AffineCoupling(in_channel, affine=affine, num_conditional=num_conditional)
 
-    def forward(self, input):
+    def forward(self, input, conditional=None):
         out, logdet = self.actnorm(input)
         out, det1 = self.invconv(out)
-        out, det2 = self.coupling(out)
+        out, det2 = self.coupling(out, conditional)
 
         logdet = logdet + det1
         if det2 is not None:
@@ -234,8 +259,8 @@ class Flow(nn.Module):
 
         return out, logdet
 
-    def reverse(self, output):
-        input = self.coupling.reverse(output)
+    def reverse(self, output, conditional=None):
+        input = self.coupling.reverse(output, conditional)
         input = self.invconv.reverse(input)
         input = self.actnorm.reverse(input)
 
@@ -251,14 +276,14 @@ def gaussian_sample(eps, mean, log_sd):
 
 
 class Block(nn.Module):
-    def __init__(self, in_channel, n_flow, split=True, affine=True, conv_lu=True):
+    def __init__(self, in_channel, n_flow, split=True, affine=True, conv_lu=True, num_conditional=None):
         super().__init__()
 
         squeeze_dim = in_channel * 4
 
         self.flows = nn.ModuleList()
         for i in range(n_flow):
-            self.flows.append(Flow(squeeze_dim, affine=affine, conv_lu=conv_lu))
+            self.flows.append(Flow(squeeze_dim, affine=affine, conv_lu=conv_lu, num_conditional=num_conditional))
 
         self.split = split
 
@@ -268,7 +293,7 @@ class Block(nn.Module):
         else:
             self.prior = ZeroConv2d(in_channel * 4, in_channel * 8)
 
-    def forward(self, input):
+    def forward(self, input, conditional=None):
         b_size, n_channel, height, width = input.shape
         squeezed = input.view(b_size, n_channel, height // 2, 2, width // 2, 2)
         squeezed = squeezed.permute(0, 1, 3, 5, 2, 4)
@@ -277,7 +302,7 @@ class Block(nn.Module):
         logdet = 0
 
         for flow in self.flows:
-            out, det = flow(out)
+            out, det = flow(out, conditional)
             logdet = logdet + det
 
         if self.split:
@@ -295,7 +320,7 @@ class Block(nn.Module):
 
         return out, logdet, log_p, z_new
 
-    def reverse(self, output, eps=None, reconstruct=False):
+    def reverse(self, output, eps=None, reconstruct=False, conditional=None):
         input = output
 
         if reconstruct:
@@ -319,7 +344,7 @@ class Block(nn.Module):
                 input = z
 
         for flow in self.flows[::-1]:
-            input = flow.reverse(input)
+            input = flow.reverse(input, conditional)
 
         b_size, n_channel, height, width = input.shape
 
@@ -334,25 +359,25 @@ class Block(nn.Module):
 
 class Glow(nn.Module):
     def __init__(
-        self, in_channel, n_flow, n_block, affine=True, conv_lu=True
+        self, in_channel, n_flow, n_block, affine=True, conv_lu=True, num_conditional=None
     ):
         super().__init__()
 
         self.blocks = nn.ModuleList()
         n_channel = in_channel
         for i in range(n_block - 1):
-            self.blocks.append(Block(n_channel, n_flow, affine=affine, conv_lu=conv_lu))
+            self.blocks.append(Block(n_channel, n_flow, affine=affine, conv_lu=conv_lu, num_conditional=num_conditional))
             n_channel *= 2
-        self.blocks.append(Block(n_channel, n_flow, split=False, affine=affine))
+        self.blocks.append(Block(n_channel, n_flow, split=False, affine=affine, num_conditional=num_conditional))
 
-    def forward(self, input):
+    def forward(self, input, conditional=None):
         log_p_sum = 0
         logdet = 0
         out = input
         z_outs = []
 
         for block in self.blocks:
-            out, det, log_p, z_new = block(out)
+            out, det, log_p, z_new = block(out, conditional)
             z_outs.append(z_new)
             logdet = logdet + det
 
@@ -361,12 +386,12 @@ class Glow(nn.Module):
 
         return log_p_sum, logdet, z_outs
 
-    def reverse(self, z_list, reconstruct=False):
+    def reverse(self, z_list, reconstruct=False, conditional=None):
         for i, block in enumerate(self.blocks[::-1]):
             if i == 0:
-                input = block.reverse(z_list[-1], z_list[-1], reconstruct=reconstruct)
+                input = block.reverse(z_list[-1], z_list[-1], reconstruct=reconstruct, conditional=conditional)
 
             else:
-                input = block.reverse(input, z_list[-(i + 1)], reconstruct=reconstruct)
+                input = block.reverse(input, z_list[-(i + 1)], reconstruct=reconstruct, conditional=conditional)
 
         return input
